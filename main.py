@@ -167,6 +167,9 @@ async def main():
     
     logger.info("✅ Environment variables loaded")
     
+    db = None
+    bot = None
+    
     try:
         # Initialize database
         logger.info("📦 Initializing database connection...")
@@ -205,30 +208,93 @@ async def main():
         logger.info("  • 14-day message retention")
         logger.info("=" * 60)
         
-        # Start bot polling
+        # Start bot polling (runs forever until stopped)
         await bot.start()
         
     except KeyboardInterrupt:
-        logger.info("\n⏹️  Received shutdown signal...")
+        logger.info("\n⏹️  Received shutdown signal (Ctrl+C)...")
     except Exception as e:
         logger.error(f"❌ Fatal error: {e}", exc_info=True)
-        sys.exit(1)
     finally:
         # Cleanup
         logger.info("🧹 Cleaning up...")
         bot_status['running'] = False
+        
+        if bot:
+            try:
+                await bot.stop()
+            except Exception as e:
+                logger.error(f"Error stopping bot: {e}")
+        
+        if db:
+            try:
+                await db.close()
+            except Exception as e:
+                logger.error(f"Error closing database: {e}")
+        
+        # Keep web server running for health checks
+        logger.info("⚠️ Web server will continue running for health checks")
+        logger.info("👋 Bot stopped. Use Ctrl+C again to fully exit.")
+
+
+async def run_with_restart():
+    """Run bot with automatic restart on failure."""
+    import signal
+    
+    shutdown_requested = asyncio.Event()
+    
+    def signal_handler(signum):
+        logger.warning(f"⚠️ Received signal {signum} - ignoring for bot stability")
+        logger.info("💡 Bot will continue running. Use multiple Ctrl+C to force stop.")
+    
+    # Override default signal handlers to prevent premature shutdown
+    loop = asyncio.get_event_loop()
+    
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
+    
+    restart_count = 0
+    max_restarts = 10
+    consecutive_failures = 0
+    
+    while restart_count < max_restarts:
         try:
-            await bot.stop()
-            await db.close()
-            if 'web_runner' in locals():
-                await web_runner.cleanup()
-        except:
-            pass
-        logger.info("👋 Bot stopped. Goodbye!")
+            if restart_count > 0:
+                logger.info(f"🔄 Restarting bot (attempt {restart_count + 1}/{max_restarts})...")
+            
+            await main()
+            
+            # If main() exits normally without error, reset failure counter
+            consecutive_failures = 0
+            logger.info("ℹ️ Bot exited normally, restarting in 5 seconds...")
+            await asyncio.sleep(5)
+            restart_count += 1
+                
+        except KeyboardInterrupt:
+            logger.info("⏹️ Keyboard interrupt received")
+            break
+        except Exception as e:
+            restart_count += 1
+            consecutive_failures += 1
+            logger.error(f"❌ Bot crashed: {e}", exc_info=True)
+            
+            if consecutive_failures >= 3:
+                logger.error("❌ Too many consecutive failures, giving up")
+                break
+            
+            if restart_count < max_restarts:
+                wait_time = min(consecutive_failures * 10, 60)
+                logger.info(f"⏳ Waiting {wait_time} seconds before restart...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error("❌ Max restart attempts reached")
+                break
+    
+    logger.info("👋 Application shutdown complete")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run_with_restart())
     except KeyboardInterrupt:
         pass
